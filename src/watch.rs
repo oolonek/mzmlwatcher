@@ -59,13 +59,10 @@ pub fn run_scan(settings: &Settings, db: &mut Database) -> Result<ScanSummary> {
             .cmp(&right.1.file.identity.canonical_path)
     });
 
-    for (failed, metadata) in parsed {
-        if failed {
-            summary.failed += 1;
-        }
-        db.upsert_metadata(&metadata)?;
-        summary.changed += 1;
-    }
+    summary.failed += parsed.iter().filter(|(failed, _)| *failed).count();
+    summary.changed += parsed.len();
+    let records = parsed.into_iter().map(|(_, metadata)| metadata).collect::<Vec<_>>();
+    db.upsert_metadata_batch(&records)?;
     Ok(summary)
 }
 

@@ -64,8 +64,13 @@ struct ParsingState {
 }
 
 pub(crate) fn parse_mzml(identity: FileIdentity) -> Result<ParsedMetadata> {
-    validate_with_mzdata(&identity.path)?;
-    let header = parse_header(&identity.path)?;
+    let header = match parse_header(&identity.path) {
+        Ok(header) => header,
+        Err(error) => {
+            validate_with_mzdata(&identity.path)?;
+            return Err(error);
+        }
+    };
 
     Ok(ParsedMetadata {
         file: FileRecord {

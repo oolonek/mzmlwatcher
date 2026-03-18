@@ -66,16 +66,17 @@ impl Database {
     /// Insert or replace metadata for a file and its child records.
     pub fn upsert_metadata(&mut self, metadata: &ParsedMetadata) -> Result<()> {
         let tx = self.conn.transaction()?;
-        let file_id = upsert_file(&tx, metadata)?;
-        clear_children(&tx, file_id)?;
-        insert_run(&tx, file_id, metadata)?;
-        insert_instrument_configs(&tx, file_id, &metadata.instrument_configs)?;
-        insert_software(&tx, file_id, &metadata.software)?;
-        insert_samples(&tx, file_id, &metadata.samples)?;
-        insert_data_processings(&tx, file_id, &metadata.data_processings)?;
-        insert_source_files(&tx, file_id, &metadata.source_files)?;
-        insert_ontologies(&tx, file_id, &metadata.ontologies)?;
-        insert_curies(&tx, file_id, &metadata.curies)?;
+        upsert_metadata_tx(&tx, metadata)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Insert or replace many parsed files in a single transaction.
+    pub fn upsert_metadata_batch(&mut self, records: &[ParsedMetadata]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for metadata in records {
+            upsert_metadata_tx(&tx, metadata)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -307,6 +308,20 @@ fn upsert_file(tx: &Transaction<'_>, metadata: &ParsedMetadata) -> Result<i64> {
         |row| row.get::<_, i64>(0),
     )?;
     Ok(file_id)
+}
+
+fn upsert_metadata_tx(tx: &Transaction<'_>, metadata: &ParsedMetadata) -> Result<()> {
+    let file_id = upsert_file(tx, metadata)?;
+    clear_children(tx, file_id)?;
+    insert_run(tx, file_id, metadata)?;
+    insert_instrument_configs(tx, file_id, &metadata.instrument_configs)?;
+    insert_software(tx, file_id, &metadata.software)?;
+    insert_samples(tx, file_id, &metadata.samples)?;
+    insert_data_processings(tx, file_id, &metadata.data_processings)?;
+    insert_source_files(tx, file_id, &metadata.source_files)?;
+    insert_ontologies(tx, file_id, &metadata.ontologies)?;
+    insert_curies(tx, file_id, &metadata.curies)?;
+    Ok(())
 }
 
 fn clear_children(tx: &Transaction<'_>, file_id: i64) -> Result<()> {
