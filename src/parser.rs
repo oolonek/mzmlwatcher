@@ -1,6 +1,6 @@
 //! mzML parsing and metadata extraction.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -15,15 +15,20 @@ use quick_xml::Reader;
 use crate::error::AppError;
 use crate::fs::now_rfc3339;
 use crate::model::{
-    DataProcessingRecord, FileIdentity, FileRecord, InstrumentConfigRecord, ParseStatus,
-    ParsedMetadata, RunRecord, SampleRecord, SoftwareRecord, SourceFileRecord, SpectrumSummary,
+    CurieRecord, DataProcessingRecord, FileIdentity, FileRecord, InstrumentConfigRecord,
+    OntologyRecord, ParseStatus, ParsedMetadata, RunRecord, SampleRecord, SoftwareRecord,
+    SourceFileRecord, SpectrumSummary,
 };
 
 #[derive(Debug, Clone, Default)]
 struct CvTerm {
+    cv_ref: Option<String>,
     accession: Option<String>,
     name: String,
     value: Option<String>,
+    unit_cv_ref: Option<String>,
+    unit_accession: Option<String>,
+    unit_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -36,8 +41,11 @@ enum ComponentKind {
 #[derive(Debug, Clone, Default)]
 struct ParsingState {
     mzml_version: Option<String>,
+    converted_file_sha1: Option<String>,
     run: RunRecord,
     spectrum: SpectrumSummary,
+    ontologies: Vec<OntologyRecord>,
+    curies: BTreeSet<CurieRecord>,
     instrument_configs: Vec<InstrumentConfigRecord>,
     software: Vec<SoftwareRecord>,
     samples: Vec<SampleRecord>,
@@ -51,6 +59,7 @@ struct ParsingState {
     current_sample: Option<SampleRecord>,
     current_data_processing: Option<DataProcessingRecord>,
     current_source_file: Option<SourceFileRecord>,
+    in_file_checksum: bool,
     in_spectrum: bool,
 }
 
@@ -64,6 +73,7 @@ pub(crate) fn parse_mzml(identity: FileIdentity) -> Result<ParsedMetadata> {
             parse_timestamp: now_rfc3339(),
             parser_version: env!("CARGO_PKG_VERSION").to_string(),
             mzml_version: header.mzml_version,
+            converted_file_sha1: header.converted_file_sha1,
             status: ParseStatus::Success,
             parse_error: None,
         },
@@ -73,6 +83,8 @@ pub(crate) fn parse_mzml(identity: FileIdentity) -> Result<ParsedMetadata> {
         samples: header.samples,
         data_processings: header.data_processings,
         source_files: header.source_files,
+        ontologies: header.ontologies,
+        curies: header.curies.into_iter().collect(),
     })
 }
 
@@ -83,6 +95,7 @@ pub(crate) fn failed_metadata(identity: FileIdentity, error: &anyhow::Error) -> 
             parse_timestamp: now_rfc3339(),
             parser_version: env!("CARGO_PKG_VERSION").to_string(),
             mzml_version: None,
+            converted_file_sha1: None,
             status: ParseStatus::Failed,
             parse_error: Some(format!("{error:#}")),
         },
@@ -92,6 +105,8 @@ pub(crate) fn failed_metadata(identity: FileIdentity, error: &anyhow::Error) -> 
         samples: Vec::new(),
         data_processings: Vec::new(),
         source_files: Vec::new(),
+        ontologies: Vec::new(),
+        curies: Vec::new(),
     }
 }
 
@@ -112,11 +127,24 @@ fn parse_header(path: &Path) -> Result<ParsingState> {
     reader.config_mut().trim_text(true);
     let mut state = ParsingState::default();
     let mut buffer = Vec::new();
+    let mut skip_buffer = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(event)) => handle_start(&event, &mut state)?,
+            Ok(Event::Start(event)) => {
+                handle_start(&event, &mut state)?;
+                if should_skip_section(event.local_name().as_ref()) {
+                    reader
+                        .read_to_end_into(event.name(), &mut skip_buffer)
+                        .map_err(|error| AppError::Xml {
+                            path: path.to_path_buf(),
+                            message: error.to_string(),
+                        })?;
+                    skip_buffer.clear();
+                }
+            }
             Ok(Event::Empty(event)) => handle_empty(&event, &mut state)?,
+            Ok(Event::Text(event)) => handle_text(&event, &mut state)?,
             Ok(Event::End(event)) => handle_end(event.local_name().as_ref(), &mut state),
             Ok(Event::Eof) => break,
             Ok(_) => {}
@@ -137,16 +165,29 @@ fn parse_header(path: &Path) -> Result<ParsingState> {
             .iter()
             .find_map(|source| source.native_id_format.clone());
     }
-    state.run.polarity = state.spectrum.polarity();
-    state.run.ms_level_coverage = state.spectrum.ms_level_coverage();
-    state.run.signal_continuity = state.spectrum.signal_continuity();
+    state.run.polarity = state.spectrum.polarity_label();
+    state.run.ms_level_coverage = state.spectrum.ms_level_coverage_label();
+    state.run.signal_continuity = state.spectrum.signal_continuity_label();
 
     Ok(state)
+}
+
+fn should_skip_section(tag: &[u8]) -> bool {
+    matches!(tag, b"binaryDataArrayList" | b"chromatogramList" | b"indexList")
 }
 
 fn handle_start(event: &BytesStart<'_>, state: &mut ParsingState) -> Result<()> {
     match event.local_name().as_ref() {
         b"mzML" => state.mzml_version = attr_value(event, b"version")?,
+        b"cv" => {
+            state.ontologies.push(OntologyRecord {
+                cv_id: attr_value(event, b"id")?.unwrap_or_default(),
+                full_name: attr_value(event, b"fullName")?,
+                version: attr_value(event, b"version")?,
+                uri: attr_value(event, b"URI")?,
+            });
+        }
+        b"fileChecksum" => state.in_file_checksum = true,
         b"referenceableParamGroup" => {
             let id = attr_value(event, b"id")?.unwrap_or_default();
             state.current_referenceable_group = Some((id, Vec::new()));
@@ -215,8 +256,23 @@ fn handle_start(event: &BytesStart<'_>, state: &mut ParsingState) -> Result<()> 
     Ok(())
 }
 
+fn handle_text(event: &quick_xml::events::BytesText<'_>, state: &mut ParsingState) -> Result<()> {
+    if state.in_file_checksum {
+        state.converted_file_sha1 = Some(String::from_utf8_lossy(event.as_ref()).trim().to_string());
+    }
+    Ok(())
+}
+
 fn handle_empty(event: &BytesStart<'_>, state: &mut ParsingState) -> Result<()> {
     match event.local_name().as_ref() {
+        b"cv" => {
+            state.ontologies.push(OntologyRecord {
+                cv_id: attr_value(event, b"id")?.unwrap_or_default(),
+                full_name: attr_value(event, b"fullName")?,
+                version: attr_value(event, b"version")?,
+                uri: attr_value(event, b"URI")?,
+            });
+        }
         b"cvParam" => apply_cv_term(parse_cv_term(event)?, state),
         b"referenceableParamGroupRef" => apply_referenceable_group(event, state)?,
         _ => {}
@@ -257,6 +313,7 @@ fn handle_end(tag: &[u8], state: &mut ParsingState) {
                 state.source_files.push(record);
             }
         }
+        b"fileChecksum" => state.in_file_checksum = false,
         b"spectrum" => state.in_spectrum = false,
         _ => {}
     }
@@ -281,6 +338,8 @@ fn apply_cv_term(term: CvTerm, state: &mut ParsingState) {
         return;
     }
 
+    track_curie(&term, state);
+
     if state.in_spectrum {
         apply_spectrum_cv_term(&term, &mut state.spectrum);
     }
@@ -298,8 +357,9 @@ fn apply_cv_term(term: CvTerm, state: &mut ParsingState) {
         return;
     }
     if let Some(data_processing) = state.current_data_processing.as_mut() {
-        if !data_processing.processing_actions.contains(&term.name) {
-            data_processing.processing_actions.push(term.name);
+        let label = format_curie_name(&term);
+        if !data_processing.processing_actions.contains(&label) {
+            data_processing.processing_actions.push(label);
         }
         return;
     }
@@ -314,12 +374,12 @@ fn apply_instrument_cv_term(
     component: Option<ComponentKind>,
 ) {
     match component {
-        Some(ComponentKind::Source) => instrument.ionization_sources.push(term.name.clone()),
-        Some(ComponentKind::Analyzer) => instrument.analyzers.push(term.name.clone()),
-        Some(ComponentKind::Detector) => instrument.detectors.push(term.name.clone()),
+        Some(ComponentKind::Source) => instrument.ionization_sources.push(format_curie_name(term)),
+        Some(ComponentKind::Analyzer) => instrument.analyzers.push(format_curie_name(term)),
+        Some(ComponentKind::Detector) => instrument.detectors.push(format_curie_name(term)),
         None => {
             if instrument.model.is_none() && !looks_like_non_model_instrument_term(term) {
-                instrument.model = Some(term.name.clone());
+                instrument.model = Some(format_curie_name(term));
             }
         }
     }
@@ -328,7 +388,7 @@ fn apply_instrument_cv_term(
 
 fn apply_software_cv_term(term: &CvTerm, software: &mut SoftwareRecord) {
     if software.name.is_none() {
-        software.name = Some(term.name.clone());
+        software.name = Some(format_curie_name(term));
     }
     software.important_cv_terms.push(format_cv_term(term));
 }
@@ -336,9 +396,9 @@ fn apply_software_cv_term(term: &CvTerm, software: &mut SoftwareRecord) {
 fn apply_source_file_cv_term(term: &CvTerm, source_file: &mut SourceFileRecord) {
     let lower = term.name.to_ascii_lowercase();
     if lower.contains("nativeid format") && source_file.native_id_format.is_none() {
-        source_file.native_id_format = Some(term.name.clone());
+        source_file.native_id_format = Some(format_curie_name(term));
     } else if lower.ends_with(" format") && source_file.file_format.is_none() {
-        source_file.file_format = Some(term.name.clone());
+        source_file.file_format = Some(format_curie_name(term));
     } else if lower == "sha-1" && source_file.checksum_sha1.is_none() {
         source_file.checksum_sha1 = term.value.clone();
     }
@@ -368,9 +428,13 @@ fn looks_like_non_model_instrument_term(term: &CvTerm) -> bool {
 
 fn parse_cv_term(event: &BytesStart<'_>) -> Result<CvTerm> {
     Ok(CvTerm {
+        cv_ref: attr_value(event, b"cvRef")?,
         accession: attr_value(event, b"accession")?,
         name: attr_value(event, b"name")?.unwrap_or_default(),
         value: attr_value(event, b"value")?,
+        unit_cv_ref: attr_value(event, b"unitCvRef")?,
+        unit_accession: attr_value(event, b"unitAccession")?,
+        unit_name: attr_value(event, b"unitName")?,
     })
 }
 
@@ -385,6 +449,13 @@ fn format_cv_term(term: &CvTerm) -> String {
     }
 }
 
+fn format_curie_name(term: &CvTerm) -> String {
+    term.accession
+        .as_ref()
+        .map(|accession| format!("{accession}|{}", term.name))
+        .unwrap_or_else(|| term.name.clone())
+}
+
 fn attr_value(event: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>> {
     for attribute in event.attributes().with_checks(false) {
         let attribute = attribute?;
@@ -397,9 +468,41 @@ fn attr_value(event: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>> {
     Ok(None)
 }
 
+fn track_curie(term: &CvTerm, state: &mut ParsingState) {
+    if let Some(accession) = &term.accession {
+        state.curies.insert(CurieRecord {
+            source_kind: "cv_param".to_string(),
+            cv_ref: term.cv_ref.clone(),
+            accession: accession.clone(),
+            name: Some(term.name.clone()),
+            ontology_uri: ontology_uri_for(term.cv_ref.as_deref(), &state.ontologies),
+        });
+    }
+    if let Some(accession) = &term.unit_accession {
+        state.curies.insert(CurieRecord {
+            source_kind: "unit".to_string(),
+            cv_ref: term.unit_cv_ref.clone(),
+            accession: accession.clone(),
+            name: term.unit_name.clone(),
+            ontology_uri: ontology_uri_for(term.unit_cv_ref.as_deref(), &state.ontologies),
+        });
+    }
+}
+
+fn ontology_uri_for(cv_ref: Option<&str>, ontologies: &[OntologyRecord]) -> Option<String> {
+    let cv_ref = cv_ref?;
+    ontologies
+        .iter()
+        .find(|ontology| ontology.cv_id == cv_ref)
+        .and_then(|ontology| ontology.uri.clone())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::collections::BTreeSet;
+
+    use tempfile::tempdir;
 
     use super::{apply_spectrum_cv_term, CvTerm};
     use crate::model::SpectrumSummary;
@@ -415,6 +518,7 @@ mod tests {
                 accession: None,
                 name: "ms level".to_string(),
                 value: Some("1".to_string()),
+                ..CvTerm::default()
             },
             &mut summary,
         );
@@ -423,6 +527,7 @@ mod tests {
                 accession: None,
                 name: "positive scan".to_string(),
                 value: None,
+                ..CvTerm::default()
             },
             &mut summary,
         );
@@ -431,11 +536,61 @@ mod tests {
                 accession: None,
                 name: "centroid spectrum".to_string(),
                 value: None,
+                ..CvTerm::default()
             },
             &mut summary,
         );
-        assert_eq!(summary.ms_level_coverage().as_deref(), Some("1"));
-        assert_eq!(summary.polarity().as_deref(), Some("positive"));
-        assert_eq!(summary.signal_continuity().as_deref(), Some("centroid"));
+        assert_eq!(summary.ms_level_coverage_label().as_deref(), Some("MS:1000511|1"));
+        assert_eq!(summary.polarity_label().as_deref(), Some("MS:1000130|positive scan"));
+        assert_eq!(
+            summary.signal_continuity_label().as_deref(),
+            Some("MS:1000127|centroid spectrum")
+        );
+    }
+
+    #[test]
+    fn extracts_converted_file_checksum() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("indexed.mzML");
+        fs::write(
+            &path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<indexedmzML xmlns="http://psi.hupo.org/ms/mzml">
+  <mzML id="x" version="1.1.0"></mzML>
+  <indexList count="0"></indexList>
+  <indexListOffset>0</indexListOffset>
+  <fileChecksum>3be919f263a1a088c82a1f1171961a7d23853cfb</fileChecksum>
+</indexedmzML>"#,
+        )
+        .unwrap();
+        let parsed = super::parse_header(&path).unwrap();
+        assert_eq!(
+            parsed.converted_file_sha1.as_deref(),
+            Some("3be919f263a1a088c82a1f1171961a7d23853cfb")
+        );
+    }
+
+    #[test]
+    fn extracts_ontologies_and_curies() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("fixture.mzML");
+        fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("minimal.mzML"),
+            &path,
+        )
+        .unwrap();
+        let parsed = super::parse_header(&path).unwrap();
+        assert_eq!(parsed.ontologies.len(), 2);
+        assert!(parsed
+            .curies
+            .iter()
+            .any(|term| term.accession == "MS:1000569"));
+        assert!(parsed
+            .curies
+            .iter()
+            .any(|term| term.accession == "UO:0000031"));
     }
 }

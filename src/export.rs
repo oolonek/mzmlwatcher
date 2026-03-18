@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use csv::WriterBuilder;
 use rusqlite::{types::ValueRef, Connection};
 
-use crate::db::SCHEMA_SQL;
+use crate::db::{CREATE_VIEW_SQL, DROP_VIEW_SQL, SCHEMA_SQL};
 
 const DEFAULT_EXPORT_SQL: &str = r#"
 SELECT
@@ -16,6 +16,7 @@ SELECT
     file_size_bytes,
     modified_time,
     checksum,
+    converted_file_sha1,
     parse_timestamp,
     parser_version,
     mzml_version,
@@ -42,7 +43,9 @@ SELECT
     data_processing_ids,
     processing_actions,
     source_file_names,
-    source_file_paths
+    source_file_paths,
+    raw_file_sha1,
+    ontology_links
 FROM v_metadata_flat
 "#;
 
@@ -95,8 +98,8 @@ pub fn export_query_to_writer<W: Write>(
 }
 
 /// Return the schema DDL used by `mzmlwatcher`.
-pub fn schema_sql() -> &'static str {
-    SCHEMA_SQL
+pub fn schema_sql() -> String {
+    format!("{SCHEMA_SQL}\n{DROP_VIEW_SQL};\n{CREATE_VIEW_SQL}")
 }
 
 fn validate_query(sql: &str) -> Result<()> {

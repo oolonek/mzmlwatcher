@@ -6,8 +6,8 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::model::{
-    DataProcessingRecord, FileIdentity, InstrumentConfigRecord, ParsedMetadata, SampleRecord,
-    SoftwareRecord, SourceFileRecord,
+    CurieRecord, DataProcessingRecord, FileIdentity, InstrumentConfigRecord, OntologyRecord,
+    ParsedMetadata, SampleRecord, SoftwareRecord, SourceFileRecord,
 };
 
 /// SQLite wrapper for schema management and upserts.
@@ -21,6 +21,12 @@ impl Database {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA_SQL)?;
+        ensure_file_column(
+            &conn,
+            "converted_file_sha1",
+            "ALTER TABLE files ADD COLUMN converted_file_sha1 TEXT",
+        )?;
+        refresh_flat_view(&conn)?;
         Ok(Self { conn })
     }
 
@@ -34,22 +40,24 @@ impl Database {
         let row = self
             .conn
             .query_row(
-                "SELECT file_size_bytes, modified_time, checksum FROM files WHERE canonical_path = ?1",
+                "SELECT file_size_bytes, modified_time, checksum, parser_version FROM files WHERE canonical_path = ?1",
                 params![identity.canonical_path],
                 |row| {
                     Ok((
                         row.get::<_, u64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
             .optional()?;
         Ok(match row {
-            Some((file_size_bytes, modified_time, checksum)) => {
+            Some((file_size_bytes, modified_time, checksum, parser_version)) => {
                 file_size_bytes == identity.file_size_bytes
                     && modified_time == identity.modified_time
                     && checksum == identity.checksum
+                    && parser_version == env!("CARGO_PKG_VERSION")
             }
             None => false,
         })
@@ -66,6 +74,8 @@ impl Database {
         insert_samples(&tx, file_id, &metadata.samples)?;
         insert_data_processings(&tx, file_id, &metadata.data_processings)?;
         insert_source_files(&tx, file_id, &metadata.source_files)?;
+        insert_ontologies(&tx, file_id, &metadata.ontologies)?;
+        insert_curies(&tx, file_id, &metadata.curies)?;
         tx.commit()?;
         Ok(())
     }
@@ -85,6 +95,7 @@ CREATE TABLE IF NOT EXISTS files (
     parse_timestamp TEXT NOT NULL,
     parser_version TEXT NOT NULL,
     mzml_version TEXT,
+    converted_file_sha1 TEXT,
     parse_status TEXT NOT NULL,
     parse_error TEXT
 );
@@ -153,14 +164,39 @@ CREATE TABLE IF NOT EXISTS source_files (
     important_cv_terms TEXT
 );
 
+CREATE TABLE IF NOT EXISTS ontologies (
+    id INTEGER PRIMARY KEY,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    cv_id TEXT NOT NULL,
+    full_name TEXT,
+    version TEXT,
+    uri TEXT
+);
+
+CREATE TABLE IF NOT EXISTS curies (
+    id INTEGER PRIMARY KEY,
+    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    source_kind TEXT NOT NULL,
+    cv_ref TEXT,
+    accession TEXT NOT NULL,
+    term_name TEXT,
+    ontology_uri TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_files_path ON files(canonical_path);
 CREATE INDEX IF NOT EXISTS idx_runs_run_id ON runs(run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_start_time_stamp ON runs(start_time_stamp);
 CREATE INDEX IF NOT EXISTS idx_samples_name ON samples(sample_name);
 CREATE INDEX IF NOT EXISTS idx_instrument_model ON instrument_configs(instrument_model);
 CREATE INDEX IF NOT EXISTS idx_source_files_name ON source_files(source_file_name);
+CREATE INDEX IF NOT EXISTS idx_ontologies_cv_id ON ontologies(cv_id);
+CREATE INDEX IF NOT EXISTS idx_curies_accession ON curies(accession);
+"#;
 
-CREATE VIEW IF NOT EXISTS v_metadata_flat AS
+pub(crate) const DROP_VIEW_SQL: &str = "DROP VIEW IF EXISTS v_metadata_flat";
+
+pub(crate) const CREATE_VIEW_SQL: &str = r#"
+CREATE VIEW v_metadata_flat AS
 SELECT
     f.id AS file_id,
     f.canonical_path AS file_path,
@@ -168,6 +204,7 @@ SELECT
     f.file_size_bytes,
     f.modified_time,
     COALESCE(f.checksum, '') AS checksum,
+    COALESCE(f.converted_file_sha1, '') AS converted_file_sha1,
     f.parse_timestamp,
     f.parser_version,
     COALESCE(f.mzml_version, '') AS mzml_version,
@@ -194,7 +231,26 @@ SELECT
     COALESCE((SELECT GROUP_CONCAT(data_processing_id, '; ') FROM data_processings dp WHERE dp.file_id = f.id), '') AS data_processing_ids,
     COALESCE((SELECT GROUP_CONCAT(processing_actions, '; ') FROM data_processings dp WHERE dp.file_id = f.id), '') AS processing_actions,
     COALESCE((SELECT GROUP_CONCAT(source_file_name, '; ') FROM source_files sf WHERE sf.file_id = f.id), '') AS source_file_names,
-    COALESCE((SELECT GROUP_CONCAT(source_file_location, '; ') FROM source_files sf WHERE sf.file_id = f.id), '') AS source_file_paths
+    COALESCE((SELECT GROUP_CONCAT(source_file_location, '; ') FROM source_files sf WHERE sf.file_id = f.id), '') AS source_file_paths,
+    COALESCE((SELECT GROUP_CONCAT(checksum_sha1, '; ') FROM source_files sf WHERE sf.file_id = f.id), '') AS raw_file_sha1,
+    COALESCE((
+        SELECT GROUP_CONCAT(link, '; ')
+        FROM (
+            SELECT DISTINCT o.cv_id || '=' || o.uri AS link
+            FROM ontologies o
+            WHERE o.file_id = f.id AND o.uri IS NOT NULL
+            ORDER BY o.cv_id
+        )
+    ), '') AS ontology_links,
+    COALESCE((
+        SELECT GROUP_CONCAT(accession, '; ')
+        FROM (
+            SELECT DISTINCT c.accession AS accession
+            FROM curies c
+            WHERE c.file_id = f.id
+            ORDER BY c.accession
+        )
+    ), '') AS ontology_curies
 FROM files f
 LEFT JOIN runs r ON r.file_id = f.id;
 "#;
@@ -212,9 +268,10 @@ fn upsert_file(tx: &Transaction<'_>, metadata: &ParsedMetadata) -> Result<i64> {
             parse_timestamp,
             parser_version,
             mzml_version,
+            converted_file_sha1,
             parse_status,
             parse_error
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ON CONFLICT(canonical_path) DO UPDATE SET
             discovered_path = excluded.discovered_path,
             file_name = excluded.file_name,
@@ -224,6 +281,7 @@ fn upsert_file(tx: &Transaction<'_>, metadata: &ParsedMetadata) -> Result<i64> {
             parse_timestamp = excluded.parse_timestamp,
             parser_version = excluded.parser_version,
             mzml_version = excluded.mzml_version,
+            converted_file_sha1 = excluded.converted_file_sha1,
             parse_status = excluded.parse_status,
             parse_error = excluded.parse_error
         "#,
@@ -237,6 +295,7 @@ fn upsert_file(tx: &Transaction<'_>, metadata: &ParsedMetadata) -> Result<i64> {
             metadata.file.parse_timestamp,
             metadata.file.parser_version,
             metadata.file.mzml_version,
+            metadata.file.converted_file_sha1,
             metadata.file.status.as_str(),
             metadata.file.parse_error,
         ],
@@ -263,6 +322,8 @@ fn clear_children(tx: &Transaction<'_>, file_id: i64) -> Result<()> {
         params![file_id],
     )?;
     tx.execute("DELETE FROM source_files WHERE file_id = ?1", params![file_id])?;
+    tx.execute("DELETE FROM ontologies WHERE file_id = ?1", params![file_id])?;
+    tx.execute("DELETE FROM curies WHERE file_id = ?1", params![file_id])?;
     Ok(())
 }
 
@@ -443,8 +504,80 @@ fn insert_source_files(
     Ok(())
 }
 
+fn insert_ontologies(tx: &Transaction<'_>, file_id: i64, records: &[OntologyRecord]) -> Result<()> {
+    let mut statement = tx.prepare(
+        r#"
+        INSERT INTO ontologies (
+            file_id,
+            cv_id,
+            full_name,
+            version,
+            uri
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )?;
+    for record in records {
+        statement.execute(params![
+            file_id,
+            record.cv_id,
+            record.full_name,
+            record.version,
+            record.uri,
+        ])?;
+    }
+    Ok(())
+}
+
+fn insert_curies(tx: &Transaction<'_>, file_id: i64, records: &[CurieRecord]) -> Result<()> {
+    let mut statement = tx.prepare(
+        r#"
+        INSERT INTO curies (
+            file_id,
+            source_kind,
+            cv_ref,
+            accession,
+            term_name,
+            ontology_uri
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )?;
+    for record in records {
+        statement.execute(params![
+            file_id,
+            record.source_kind,
+            record.cv_ref,
+            record.accession,
+            record.name,
+            record.ontology_uri,
+        ])?;
+    }
+    Ok(())
+}
+
 fn join(values: &[String]) -> String {
     values.join("; ")
+}
+
+fn refresh_flat_view(conn: &Connection) -> Result<()> {
+    conn.execute(DROP_VIEW_SQL, [])?;
+    conn.execute_batch(CREATE_VIEW_SQL)?;
+    Ok(())
+}
+
+fn ensure_file_column(conn: &Connection, column_name: &str, sql: &str) -> Result<()> {
+    let mut statement = conn.prepare("PRAGMA table_info(files)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut found = false;
+    for column in columns {
+        if column? == column_name {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        conn.execute(sql, [])?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -453,15 +586,18 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Database, SCHEMA_SQL};
+    use super::{CREATE_VIEW_SQL, Database, SCHEMA_SQL};
     use crate::fs::now_rfc3339;
     use crate::model::{
-        FileIdentity, FileRecord, ParseStatus, ParsedMetadata, RunRecord, SpectrumSummary,
+        CurieRecord, FileIdentity, FileRecord, OntologyRecord, ParseStatus, ParsedMetadata,
+        RunRecord, SpectrumSummary,
     };
 
     #[test]
     fn schema_contains_flat_view() {
-        assert!(SCHEMA_SQL.contains("CREATE VIEW IF NOT EXISTS v_metadata_flat"));
+        assert!(CREATE_VIEW_SQL.contains("CREATE VIEW v_metadata_flat"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS ontologies"));
+        assert!(SCHEMA_SQL.contains("CREATE TABLE IF NOT EXISTS curies"));
     }
 
     #[test]
@@ -478,6 +614,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+        let ontology_count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ontologies'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ontology_count, 1);
+        let checksum_column_count: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'converted_file_sha1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checksum_column_count, 1);
     }
 
     #[test]
@@ -496,8 +650,9 @@ mod tests {
                     checksum: Some("abc".to_string()),
                 },
                 parse_timestamp: now_rfc3339(),
-                parser_version: "0.1.0".to_string(),
+                parser_version: "0.1.3".to_string(),
                 mzml_version: Some("1.1.0".to_string()),
+                converted_file_sha1: Some("def".to_string()),
                 status: ParseStatus::Success,
                 parse_error: None,
             },
@@ -511,6 +666,19 @@ mod tests {
             samples: Vec::new(),
             data_processings: Vec::new(),
             source_files: Vec::new(),
+            ontologies: vec![OntologyRecord {
+                cv_id: "MS".to_string(),
+                full_name: Some("Mass spectrometry".to_string()),
+                version: Some("1".to_string()),
+                uri: Some("https://example.org/ms.obo".to_string()),
+            }],
+            curies: vec![CurieRecord {
+                source_kind: "cv_param".to_string(),
+                cv_ref: Some("MS".to_string()),
+                accession: "MS:1000569".to_string(),
+                name: Some("SHA-1".to_string()),
+                ontology_uri: Some("https://example.org/ms.obo".to_string()),
+            }],
         };
         db.upsert_metadata(&metadata).unwrap();
         assert!(db.is_unchanged(&metadata.file.identity).unwrap());

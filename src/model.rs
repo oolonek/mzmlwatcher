@@ -59,6 +59,8 @@ pub struct FileRecord {
     pub parser_version: String,
     /// mzML version if present.
     pub mzml_version: Option<String>,
+    /// Converted mzML file SHA-1 from the trailing `<fileChecksum>` element, when present.
+    pub converted_file_sha1: Option<String>,
     /// Whether parsing succeeded.
     pub status: ParseStatus,
     /// Optional parse error text.
@@ -163,6 +165,34 @@ pub struct SourceFileRecord {
     pub important_cv_terms: Vec<String>,
 }
 
+/// Controlled vocabulary definition declared in `<cvList>`.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct OntologyRecord {
+    /// Short CV identifier, for example `MS`.
+    pub cv_id: String,
+    /// Full ontology name.
+    pub full_name: Option<String>,
+    /// Ontology version string.
+    pub version: Option<String>,
+    /// Ontology URI link.
+    pub uri: Option<String>,
+}
+
+/// Distinct CURIE observed in the parsed mzML metadata.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub struct CurieRecord {
+    /// CURIE source kind, either `cv_param` or `unit`.
+    pub source_kind: String,
+    /// CV reference used by the term, for example `MS`.
+    pub cv_ref: Option<String>,
+    /// CURIE such as `MS:1000569`.
+    pub accession: String,
+    /// Label associated with the CURIE.
+    pub name: Option<String>,
+    /// Ontology URI resolved from the file's `<cvList>`.
+    pub ontology_uri: Option<String>,
+}
+
 /// Parsed metadata for one mzML file.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ParsedMetadata {
@@ -180,6 +210,10 @@ pub struct ParsedMetadata {
     pub data_processings: Vec<DataProcessingRecord>,
     /// Source file list.
     pub source_files: Vec<SourceFileRecord>,
+    /// Ontology definitions found in `<cvList>`.
+    pub ontologies: Vec<OntologyRecord>,
+    /// Distinct CURIEs found across parsed metadata.
+    pub curies: Vec<CurieRecord>,
 }
 
 /// Summary returned by a scan cycle.
@@ -236,12 +270,38 @@ impl SpectrumSummary {
         }
     }
 
+    /// Convert the set of observed MS levels into a CURIE-prefixed representation.
+    pub fn ms_level_coverage_label(&self) -> Option<String> {
+        self.ms_level_coverage()
+            .map(|value| format!("MS:1000511|{value}"))
+    }
+
     /// Convert aggregate flags into a normalized continuity string.
     pub fn signal_continuity(&self) -> Option<String> {
         match (self.saw_centroid, self.saw_profile) {
             (true, true) => Some("mixed".to_string()),
             (true, false) => Some("centroid".to_string()),
             (false, true) => Some("profile".to_string()),
+            (false, false) => None,
+        }
+    }
+
+    /// Convert aggregate polarity flags into CURIE-prefixed labels.
+    pub fn polarity_label(&self) -> Option<String> {
+        match (self.saw_positive, self.saw_negative) {
+            (true, true) => Some("MS:1000130|positive scan; MS:1000129|negative scan".to_string()),
+            (true, false) => Some("MS:1000130|positive scan".to_string()),
+            (false, true) => Some("MS:1000129|negative scan".to_string()),
+            (false, false) => None,
+        }
+    }
+
+    /// Convert aggregate continuity flags into CURIE-prefixed labels.
+    pub fn signal_continuity_label(&self) -> Option<String> {
+        match (self.saw_centroid, self.saw_profile) {
+            (true, true) => Some("MS:1000127|centroid spectrum; MS:1000128|profile spectrum".to_string()),
+            (true, false) => Some("MS:1000127|centroid spectrum".to_string()),
+            (false, true) => Some("MS:1000128|profile spectrum".to_string()),
             (false, false) => None,
         }
     }

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use notify::{Config as NotifyConfig, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
+use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
 use crate::config::Settings;
@@ -19,6 +20,7 @@ use crate::parser::{failed_metadata, parse_mzml};
 /// Perform a one-shot directory scan and persist new or changed files.
 pub fn run_scan(settings: &Settings, db: &mut Database) -> Result<ScanSummary> {
     let mut summary = ScanSummary::default();
+    let mut to_parse = Vec::new();
     for candidate in collect_candidates(&settings.root, settings.recursive)? {
         summary.scanned += 1;
         if !candidate.is_settled(settings.settle_delay, SystemTime::now()) {
@@ -26,7 +28,35 @@ pub fn run_scan(settings: &Settings, db: &mut Database) -> Result<ScanSummary> {
             summary.skipped += 1;
             continue;
         }
-        process_candidate(candidate, settings, db, &mut summary)?;
+        let identity = candidate.to_identity(settings.checksum)?;
+        if db.is_unchanged(&identity)? {
+            summary.skipped += 1;
+            continue;
+        }
+        to_parse.push(identity);
+    }
+
+    let mut parsed = to_parse
+        .into_par_iter()
+        .map(|identity| match parse_mzml(identity.clone()) {
+            Ok(metadata) => (false, metadata),
+            Err(error) => (true, failed_metadata(identity, &error)),
+        })
+        .collect::<Vec<_>>();
+    parsed.sort_by(|left, right| {
+        left.1
+            .file
+            .identity
+            .canonical_path
+            .cmp(&right.1.file.identity.canonical_path)
+    });
+
+    for (failed, metadata) in parsed {
+        if failed {
+            summary.failed += 1;
+        }
+        db.upsert_metadata(&metadata)?;
+        summary.changed += 1;
     }
     Ok(summary)
 }
