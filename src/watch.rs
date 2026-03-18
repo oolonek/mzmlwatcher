@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use notify::{Config as NotifyConfig, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher};
 use rayon::prelude::*;
 use tracing::{debug, info, warn};
@@ -36,13 +37,20 @@ pub fn run_scan(settings: &Settings, db: &mut Database) -> Result<ScanSummary> {
         to_parse.push(identity);
     }
 
+    let progress = progress_bar(to_parse.len());
+    let worker_bar = progress.clone();
     let mut parsed = to_parse
         .into_par_iter()
-        .map(|identity| match parse_mzml(identity.clone()) {
-            Ok(metadata) => (false, metadata),
-            Err(error) => (true, failed_metadata(identity, &error)),
+        .map(move |identity| {
+            let result = match parse_mzml(identity.clone()) {
+                Ok(metadata) => (false, metadata),
+                Err(error) => (true, failed_metadata(identity, &error)),
+            };
+            worker_bar.inc(1);
+            result
         })
         .collect::<Vec<_>>();
+    progress.finish_and_clear();
     parsed.sort_by(|left, right| {
         left.1
             .file
@@ -59,6 +67,26 @@ pub fn run_scan(settings: &Settings, db: &mut Database) -> Result<ScanSummary> {
         summary.changed += 1;
     }
     Ok(summary)
+}
+
+fn progress_bar(total: usize) -> ProgressBar {
+    let bar = ProgressBar::with_draw_target(
+        Some(total as u64),
+        ProgressDrawTarget::stderr_with_hz(10),
+    )
+    .with_style(progress_style())
+    .with_message("parsing mzML headers");
+    bar.enable_steady_tick(Duration::from_millis(100));
+    bar.tick();
+    bar
+}
+
+fn progress_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos:>4}/{len:4} {msg}",
+    )
+    .expect("progress template must be valid")
+    .progress_chars("##-")
 }
 
 /// Watch a directory continuously and reprocess changed files idempotently.
