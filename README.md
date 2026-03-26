@@ -118,6 +118,12 @@ SELECT DISTINCT software_names, software_versions
 FROM v_metadata_flat
 ORDER BY software_names;
 
+SELECT COUNT(*) AS positive_2025_file_count
+FROM v_metadata_flat
+WHERE polarity = 'MS:1000130|positive scan'
+  AND acquisition_date >= '2025-01-01'
+  AND acquisition_date < '2026-01-01';
+
 SELECT file_path, source_file_names
 FROM v_metadata_flat
 WHERE source_file_names LIKE '%RAW%';
