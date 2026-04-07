@@ -1,6 +1,7 @@
 //! SQLite storage and schema management.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -20,6 +21,9 @@ impl Database {
     /// Open or create the SQLite database and ensure the schema exists.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(10))?;
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         conn.execute_batch(SCHEMA_SQL)?;
         ensure_file_column(
             &conn,

@@ -9,6 +9,12 @@
 //! mzmlwatcher scan /path/to/mzml --sqlite metadata.sqlite --recursive
 //! mzmlwatcher export-tsv metadata.sqlite metadata.tsv
 //! mzmlwatcher query metadata.sqlite --sql "SELECT file_path, sample_name FROM v_metadata_flat"
+//!
+//! # Or, with a local .env file:
+//! MZMLWATCHER_SCAN_DIR=/path/to/mzml
+//! MZMLWATCHER_OUTPUT_DIR=/path/to/output
+//! mzmlwatcher scan
+//! mzmlwatcher export-tsv
 //! ```
 
 #![forbid(unsafe_code)]

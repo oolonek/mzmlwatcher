@@ -4,6 +4,15 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
+/// `.env` / environment variable used for the scan root.
+pub const ENV_SCAN_DIR: &str = "MZMLWATCHER_SCAN_DIR";
+/// `.env` / environment variable used for the output directory.
+pub const ENV_OUTPUT_DIR: &str = "MZMLWATCHER_OUTPUT_DIR";
+/// `.env` / environment variable used for the SQLite path.
+pub const ENV_SQLITE: &str = "MZMLWATCHER_SQLITE";
+/// `.env` / environment variable used for the TSV path.
+pub const ENV_TSV: &str = "MZMLWATCHER_TSV";
+
 /// Top-level CLI definition.
 #[derive(Debug, Parser)]
 #[command(name = "mzmlwatcher", version, about = "Index mzML metadata into SQLite and TSV")]
@@ -46,12 +55,16 @@ pub enum ChecksumArg {
 /// Common scan/watch options.
 #[derive(Debug, Args, Clone)]
 pub struct IngestArgs {
+    /// Output directory used to derive default SQLite / TSV paths.
+    #[arg(long, env = ENV_OUTPUT_DIR)]
+    pub output_dir: Option<PathBuf>,
+
     /// SQLite database path.
-    #[arg(long, default_value = "mzmlwatcher.sqlite")]
-    pub sqlite: PathBuf,
+    #[arg(long, env = ENV_SQLITE)]
+    pub sqlite: Option<PathBuf>,
 
     /// Optionally export the flattened metadata view after updates.
-    #[arg(long)]
+    #[arg(long, env = ENV_TSV)]
     pub tsv: Option<PathBuf>,
 
     /// Recurse into subdirectories.
@@ -75,7 +88,8 @@ pub struct IngestArgs {
 #[derive(Debug, Args, Clone)]
 pub struct ScanArgs {
     /// Directory containing `.mzML` files.
-    pub directory: PathBuf,
+    #[arg(env = ENV_SCAN_DIR)]
+    pub directory: Option<PathBuf>,
 
     /// Shared ingest configuration.
     #[command(flatten)]
@@ -86,7 +100,8 @@ pub struct ScanArgs {
 #[derive(Debug, Args, Clone)]
 pub struct WatchArgs {
     /// Directory containing `.mzML` files.
-    pub directory: PathBuf,
+    #[arg(env = ENV_SCAN_DIR)]
+    pub directory: Option<PathBuf>,
 
     /// Shared ingest configuration.
     #[command(flatten)]
@@ -100,11 +115,17 @@ pub struct WatchArgs {
 /// Arguments for `export-tsv`.
 #[derive(Debug, Args, Clone)]
 pub struct ExportTsvArgs {
+    /// Output directory used to derive default SQLite / TSV paths.
+    #[arg(long, env = ENV_OUTPUT_DIR)]
+    pub output_dir: Option<PathBuf>,
+
     /// SQLite database path.
-    pub sqlite_path: PathBuf,
+    #[arg(env = ENV_SQLITE)]
+    pub sqlite_path: Option<PathBuf>,
 
     /// Output TSV path.
-    pub output_tsv: PathBuf,
+    #[arg(env = ENV_TSV)]
+    pub output_tsv: Option<PathBuf>,
 
     /// Include rows for files that failed parsing.
     #[arg(long)]
@@ -114,8 +135,13 @@ pub struct ExportTsvArgs {
 /// Arguments for `query`.
 #[derive(Debug, Args, Clone)]
 pub struct QueryArgs {
+    /// Output directory used to derive the default SQLite path.
+    #[arg(long, env = ENV_OUTPUT_DIR)]
+    pub output_dir: Option<PathBuf>,
+
     /// SQLite database path.
-    pub sqlite_path: PathBuf,
+    #[arg(env = ENV_SQLITE)]
+    pub sqlite_path: Option<PathBuf>,
 
     /// Read-only SQL query to execute.
     #[arg(long)]
@@ -125,6 +151,11 @@ pub struct QueryArgs {
 /// Arguments for `schema`.
 #[derive(Debug, Args, Clone)]
 pub struct SchemaArgs {
+    /// Output directory used to derive the default SQLite path.
+    #[arg(long, env = ENV_OUTPUT_DIR)]
+    pub output_dir: Option<PathBuf>,
+
     /// SQLite database path.
-    pub sqlite_path: PathBuf,
+    #[arg(env = ENV_SQLITE)]
+    pub sqlite_path: Option<PathBuf>,
 }

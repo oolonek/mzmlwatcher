@@ -1,6 +1,7 @@
 mod common;
 
 use std::fs;
+use std::path::Path;
 
 use predicates::str::contains;
 use rusqlite::Connection;
@@ -15,6 +16,7 @@ fn scan_populates_sqlite_metadata() {
     let db_path = tempdir.path().join("metadata.sqlite");
 
     cargo_bin()
+        .current_dir(tempdir.path())
         .args([
             "scan",
             tempdir.path().to_str().unwrap(),
@@ -51,6 +53,7 @@ fn export_tsv_writes_stable_header() {
     let tsv_path = tempdir.path().join("metadata.tsv");
 
     cargo_bin()
+        .current_dir(tempdir.path())
         .args([
             "scan",
             tempdir.path().to_str().unwrap(),
@@ -63,6 +66,7 @@ fn export_tsv_writes_stable_header() {
         .success();
 
     cargo_bin()
+        .current_dir(tempdir.path())
         .args([
             "export-tsv",
             db_path.to_str().unwrap(),
@@ -71,7 +75,16 @@ fn export_tsv_writes_stable_header() {
         .assert()
         .success();
 
-    let expected_header = fs::read_to_string(fixture_path("expected_header.tsv")).unwrap();
+    let expected_header = concat!(
+        "file_path\tfile_name\tfile_size_bytes\tmodified_time\tchecksum\tconverted_file_sha1\t",
+        "parse_timestamp\tparser_version\tmzml_version\tparse_status\tparse_error\trun_id\t",
+        "acquisition_date\tdefault_instrument_configuration_ref\tdefault_source_file_ref\t",
+        "sample_ref\tnative_id_format\tpolarity\tms_level_coverage\tspectrum_count\t",
+        "chromatogram_count\tsignal_continuity\tsample_name\tinstrument_model\t",
+        "ionization_source\tanalyzer\tdetector\tsoftware_names\tsoftware_versions\t",
+        "data_processing_ids\tprocessing_actions\tsource_file_names\tsource_file_paths\t",
+        "raw_file_sha1\tontology_links\n"
+    );
     let exported = fs::read_to_string(tsv_path).unwrap();
     let actual_header = exported.lines().next().unwrap().to_string() + "\n";
     assert_eq!(actual_header, expected_header);
@@ -85,6 +98,7 @@ fn export_tsv_works_on_existing_database() {
     let tsv_path = tempdir.path().join("metadata.tsv");
 
     cargo_bin()
+        .current_dir(tempdir.path())
         .args([
             "scan",
             tempdir.path().to_str().unwrap(),
@@ -97,6 +111,7 @@ fn export_tsv_works_on_existing_database() {
         .success();
 
     cargo_bin()
+        .current_dir(tempdir.path())
         .args([
             "export-tsv",
             db_path.to_str().unwrap(),
@@ -115,6 +130,7 @@ fn query_prints_tabular_output() {
     let db_path = tempdir.path().join("metadata.sqlite");
 
     cargo_bin()
+        .current_dir(tempdir.path())
         .args([
             "scan",
             tempdir.path().to_str().unwrap(),
@@ -127,6 +143,7 @@ fn query_prints_tabular_output() {
         .success();
 
     cargo_bin()
+        .current_dir(tempdir.path())
         .args([
             "query",
             db_path.to_str().unwrap(),
@@ -137,4 +154,49 @@ fn query_prints_tabular_output() {
         .success()
         .stdout(contains("file_name\tinstrument_model"))
         .stdout(contains("fixture.mzML\tMS:1002634|Q Exactive Plus"));
+}
+
+#[test]
+fn scan_and_export_use_dotenv_defaults() {
+    let tempdir = tempdir().unwrap();
+    let scan_dir = tempdir.path().join("input");
+    let output_dir = tempdir.path().join("output");
+    fs::create_dir_all(&scan_dir).unwrap();
+    install_fixture_at(&scan_dir, "fixture.mzML");
+    fs::write(
+        tempdir.path().join(".env"),
+        format!(
+            "MZMLWATCHER_SCAN_DIR={}\nMZMLWATCHER_OUTPUT_DIR={}\n",
+            scan_dir.display(),
+            output_dir.display()
+        ),
+    )
+    .unwrap();
+
+    cargo_bin()
+        .current_dir(tempdir.path())
+        .args(["scan", "--settle-seconds", "0"])
+        .assert()
+        .success()
+        .stdout(contains("scanned=1 changed=1 skipped=0 failed=0"));
+
+    let db_path = output_dir.join("mzmlwatcher.sqlite");
+    let tsv_path = output_dir.join("mzmlwatcher.tsv");
+    assert!(db_path.exists());
+    assert!(tsv_path.exists());
+
+    cargo_bin()
+        .current_dir(tempdir.path())
+        .args(["export-tsv"])
+        .assert()
+        .success();
+
+    let exported = fs::read_to_string(tsv_path).unwrap();
+    assert!(exported.contains("fixture.mzML"));
+}
+
+fn install_fixture_at(directory: &Path, file_name: &str) {
+    let source = fixture_path("minimal.mzML");
+    let target = directory.join(file_name);
+    fs::copy(source, target).unwrap();
 }

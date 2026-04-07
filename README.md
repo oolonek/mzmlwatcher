@@ -6,11 +6,11 @@ The project is intentionally limited to metadata and provenance. It does not sto
 
 ## Features
 
-- `scan <directory>` for one-shot ingestion
-- `watch <directory>` for continuous ingestion of new or changed files
-- `export-tsv <sqlite_path> <output_tsv>` for stable TSV export
-- `query <sqlite_path> [--sql "..."]` for read-only ad hoc SQL
-- `schema <sqlite_path>` to print the schema DDL
+- `scan [directory]` for one-shot ingestion
+- `watch [directory]` for continuous ingestion of new or changed files
+- `export-tsv [sqlite_path] [output_tsv]` for stable TSV export
+- `query [sqlite_path] [--sql "..."]` for read-only ad hoc SQL
+- `schema [sqlite_path]` to print the schema DDL
 - `version`
 
 ## Installation
@@ -24,6 +24,32 @@ Or run directly from the workspace:
 ```bash
 cargo run -- scan ./data --sqlite mzmlwatcher.sqlite --settle-seconds 0
 ```
+
+## `.env` Defaults
+
+`mzmlwatcher` will load a local `.env` file automatically before parsing CLI arguments. Explicit CLI arguments still win, but you can keep the common paths in one place and use shorter commands.
+
+Example:
+
+```dotenv
+MZMLWATCHER_SCAN_DIR=./data
+MZMLWATCHER_OUTPUT_DIR=./output
+```
+
+With that file in place:
+
+```bash
+mzmlwatcher scan --settle-seconds 0
+mzmlwatcher watch --recursive
+mzmlwatcher export-tsv
+```
+
+Path resolution rules:
+
+- `MZMLWATCHER_SCAN_DIR` supplies the default directory for `scan` and `watch`
+- `MZMLWATCHER_OUTPUT_DIR` makes `mzmlwatcher.sqlite` and `mzmlwatcher.tsv` default to that directory
+- `MZMLWATCHER_SQLITE` overrides just the database file path
+- `MZMLWATCHER_TSV` overrides just the TSV export path
 
 ## Example Commands
 
@@ -49,6 +75,14 @@ Export TSV:
 
 ```bash
 mzmlwatcher export-tsv mzmlwatcher.sqlite mzmlwatcher.tsv
+```
+
+The same commands can be shortened when `.env` already defines the common paths:
+
+```bash
+mzmlwatcher scan
+mzmlwatcher watch --poll-interval 10
+mzmlwatcher export-tsv
 ```
 
 Read-only query:
